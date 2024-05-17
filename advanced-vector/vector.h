@@ -119,10 +119,7 @@ public:
 
     iterator begin() noexcept
     {
-        if (size_ > 0)
-            return &data_[0];
-        else
-            return nullptr;
+        return data_.GetAddress();
     }
 
     iterator end() noexcept
@@ -132,10 +129,7 @@ public:
 
     const_iterator begin() const noexcept
     {
-        if (size_ > 0)
-            return &data_[0];
-        else
-            return nullptr;
+        return data_.GetAddress();
     }
 
     const_iterator end() const noexcept
@@ -153,7 +147,62 @@ public:
         return end();
     }
 
+    //###EMPLACE() DEPENDENCIES START#####
+    private:
+    
+    void EmplaceWithAllocationMove(RawMemory<T>& temp_container, size_t offset, const_iterator pos)
+    {
+        try
+        {
+            std::uninitialized_move_n(data_.GetAddress(), offset, temp_container.GetAddress());
+            std::uninitialized_move_n(data_.GetAddress() + offset, std::distance(pos, cend()), temp_container.GetAddress() + offset + 1);
+        }
+        catch (...)
+        {
+            std::destroy_at(temp_container.GetAddress() + offset);
+            temp_container.~RawMemory();
+        }
+    }
+    
+    void EmplaceWithAllocationCopy(RawMemory<T>& temp_container, size_t offset, const_iterator pos)
+    {
+        try
+        {
+            std::uninitialized_copy_n(data_.GetAddress(), offset, temp_container.GetAddress());
+            std::uninitialized_copy_n(data_.GetAddress() + offset, std::distance(pos, cend()), temp_container.GetAddress() + offset);
+        }
+        catch (...)
+        {
+            std::destroy_at(temp_container.GetAddress() + offset);
+            temp_container.~RawMemory();
+        }
+    }
+    
+    void EmplaceWithAllocation(RawMemory<T>& temp_container, size_t offset, const_iterator pos)
+    {
+        if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>)
+        {
+            EmplaceWithAllocationMove(temp_container, offset, pos);
+        }
+        else
+        {
+            EmplaceWithAllocationCopy(temp_container, offset, pos);
+        }
 
+        std::destroy_n(data_.GetAddress(), size_);
+
+        data_.Swap(temp_container);
+    }
+    
+    void EmplaceNoAllocation(T obj, size_t offset)
+    {
+        std::move_backward(begin() + offset, end(), begin() + size_ + 1);
+        new (data_ + offset) T(std::forward<T>(obj));
+    }
+    
+    public:
+    //###EMPLACE() DEPENDENCIES END#######
+    
     template <typename... Args>
     iterator Emplace(const_iterator pos, Args&&... args)
     {
@@ -161,49 +210,14 @@ public:
 
         if (Capacity() <= size_)
         {
-
             RawMemory<T> new_data(Capacity() == 0 ? 1 : (Capacity() * 2));
-
             new (new_data + offset) T(std::forward<Args>(args)...);
 
-
-            if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>)
-            {
-                try
-                {
-                    std::uninitialized_move_n(data_.GetAddress(), offset, new_data.GetAddress());
-                    std::uninitialized_move_n(data_.GetAddress() + offset, std::distance(pos, cend()), new_data.GetAddress() + offset + 1);
-                }
-                catch (...)
-                {
-                    std::destroy_at(new_data.GetAddress() + offset);
-                    new_data.~RawMemory();
-                }
-            }
-            else
-            {
-                try
-                {
-                    std::uninitialized_copy_n(data_.GetAddress(), offset, new_data.GetAddress());
-                    std::uninitialized_copy_n(data_.GetAddress() + offset, std::distance(pos, cend()), new_data.GetAddress() + offset);
-                }
-                catch (...)
-                {
-                    std::destroy_at(new_data.GetAddress() + offset);
-                    new_data.~RawMemory();
-                }
-            }
-
-            std::destroy_n(data_.GetAddress(), size_);
-
-            data_.Swap(new_data);
+            EmplaceWithAllocation(new_data, offset, pos);
         }
         else
         {
-            T obj(std::forward<Args>(args)...);
-            std::move_backward(begin() + offset, end(), begin() + size_ + 1);
-            //std::destroy_at(data_.GetAddress() + offset);
-            new (data_ + offset) T(std::forward<T>(obj));
+            EmplaceNoAllocation(T(std::forward<Args>(args)...), offset);
         }
 
         ++size_;
@@ -230,7 +244,7 @@ public:
             std::destroy_at(begin() + size_ - 1);
         }
 
-        size_ -= 1;
+        size_--;
 
         return &data_[pos - begin()];
     }
@@ -272,8 +286,7 @@ public:
 
     void PopBack() /* noexcept */
     {
-        std::destroy_n(data_.GetAddress() + size_ - 1, 1);
-        size_ -= 1;
+        Erase(end() - 1);
     }
 
     Vector& operator=(const Vector& rhs)
@@ -290,14 +303,13 @@ public:
             {
                 size_t new_size = rhs.Size();
 
+                std::copy_n(rhs.data_.GetAddress(), new_size <= size_ ? new_size : size_, data_.GetAddress());
                 if (new_size <= size_)
                 {
-                    std::copy_n(rhs.data_.GetAddress(), new_size, data_.GetAddress());
                     std::destroy_n(data_.GetAddress() + new_size, size_ - new_size);
                 }
                 else
                 {
-                    std::copy_n(rhs.data_.GetAddress(), size_, data_.GetAddress());
                     std::uninitialized_copy_n(rhs.data_.GetAddress() + size_, new_size - size_, data_.GetAddress() + size_);
                 }
                 size_ = new_size;
@@ -385,17 +397,12 @@ public:
         if (Capacity() > size_)
         {
             new (data_ + size_) T(std::forward<Args>(args)...);
-
+            ++size_;
         }
         else
         {
-            RawMemory<T> new_data(size_ == Capacity() ? (Capacity() == 0 ? 1 : (Capacity() * 2)) : Capacity()); // holy shit
-
-            new (new_data + size_) T(std::forward<Args>(args)...);
-
-            MoveOrCopy(new_data);
+            return *Emplace(end(), std::forward<Args>(args)...);
         }
-        ++size_;
 
         return data_[size_ - 1];
     }
